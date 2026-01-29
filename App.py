@@ -17,21 +17,22 @@ st.set_page_config(
 )
 
 # --- PARCHE SSL PARA SITIOS GUBERNAMENTALES (.GOB.AR) ---
-# CORRECCIÓN APLICADA: Evita el conflicto entre check_hostname y verify_mode
+# CORRECCIÓN CRÍTICA APLICADA:
+# Se desactiva check_hostname ANTES de verify_mode para evitar el error "Cannot set verify_mode..."
 class LegacySSLAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False):
         ctx = create_urllib3_context()
         ctx.load_default_certs()
         
-        # 1. Configurar cifrados antiguos (SECLEVEL=1) para compatibilidad con Gobierno
+        # 1. Intentar configurar cifrados antiguos (SECLEVEL=1)
         try:
             ctx.set_ciphers('DEFAULT@SECLEVEL=1')
         except Exception:
             pass
 
-        # 2. Desactivar verificaciones estrictas (CRÍTICO: El orden importa)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        # 2. Desactivar verificaciones estrictas EN ORDEN CORRECTO
+        ctx.check_hostname = False  # <--- Esto debe ir primero
+        ctx.verify_mode = ssl.CERT_NONE # <--- Esto va después
         
         self.poolmanager = PoolManager(
             num_pools=connections,
@@ -79,7 +80,7 @@ def extract_viewstate(html_content):
 def iniciar_sesion_bcra():
     """
     Paso 1 BCRA: Entra a la home, obtiene cookies y campos ocultos, y baja el Captcha.
-    Usa el adaptador LegacySSL para evitar errores de conexión.
+    Usa el adaptador LegacySSL corregido.
     """
     session = requests.Session()
     # APLICAMOS EL PARCHE AQUÍ:
@@ -106,7 +107,8 @@ def iniciar_sesion_bcra():
         else:
             return None
     except Exception as e:
-        st.error(f"Error técnico conectando con BCRA: {str(e)}")
+        # Si falla aquí, mostramos el error técnico para depurar (como hiciste con la captura)
+        st.error(f"Error de conexión con BCRA: {str(e)}")
         return None
 
 def procesar_bcra_resultados(cuit, captcha_text):
