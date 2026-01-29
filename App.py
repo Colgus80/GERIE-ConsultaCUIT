@@ -17,13 +17,22 @@ st.set_page_config(
 )
 
 # --- PARCHE SSL PARA SITIOS GUBERNAMENTALES (.GOB.AR) ---
-# Esto soluciona el error de conexión en servidores modernos (como Streamlit Cloud)
+# CORRECCIÓN APLICADA: Evita el conflicto entre check_hostname y verify_mode
 class LegacySSLAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False):
         ctx = create_urllib3_context()
         ctx.load_default_certs()
-        # "Bajamos" la seguridad para aceptar cifrados viejos del gobierno
-        ctx.set_ciphers('DEFAULT@SECLEVEL=1')
+        
+        # 1. Configurar cifrados antiguos (SECLEVEL=1) para compatibilidad con Gobierno
+        try:
+            ctx.set_ciphers('DEFAULT@SECLEVEL=1')
+        except Exception:
+            pass
+
+        # 2. Desactivar verificaciones estrictas (CRÍTICO: El orden importa)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
         self.poolmanager = PoolManager(
             num_pools=connections,
             maxsize=maxsize,
@@ -84,21 +93,20 @@ def iniciar_sesion_bcra():
     
     try:
         # A. Obtener la página del formulario para sacar ViewState y Cookies
-        r_form = session.get(url_form, verify=False, timeout=15)
+        r_form = session.get(url_form, verify=False, timeout=20)
         form_data = extract_viewstate(r_form.text)
         
         # B. Obtener la imagen del Captcha (usando la misma sesión)
-        r_captcha = session.get(url_captcha, verify=False, timeout=15)
+        r_captcha = session.get(url_captcha, verify=False, timeout=20)
         
         if r_captcha.status_code == 200:
             st.session_state.bcra_session = session
             st.session_state.bcra_payload_data = form_data
             return r_captcha.content
         else:
-            st.error(f"Error descargando captcha. Status: {r_captcha.status_code}")
             return None
     except Exception as e:
-        st.error(f"Error de conexión con BCRA: {str(e)}")
+        st.error(f"Error técnico conectando con BCRA: {str(e)}")
         return None
 
 def procesar_bcra_resultados(cuit, captcha_text):
@@ -122,7 +130,7 @@ def procesar_bcra_resultados(cuit, captcha_text):
     total_deuda = 0.0
     
     try:
-        r_post = session.post(url_post, data=payload, verify=False, timeout=20)
+        r_post = session.post(url_post, data=payload, verify=False, timeout=30)
         soup = BeautifulSoup(r_post.text, 'html.parser')
         
         # Lógica de búsqueda flexible en tablas
@@ -138,7 +146,6 @@ def procesar_bcra_resultados(cuit, captcha_text):
                         txt_cols = [c.text.strip() for c in cols]
                         
                         motivo = ""
-                        monto = 0.0
                         
                         # Buscamos el motivo en las columnas
                         for txt in txt_cols:
@@ -148,8 +155,7 @@ def procesar_bcra_resultados(cuit, captcha_text):
                         # Si encontramos el motivo SIN FONDOS
                         if "SIN FONDOS" in motivo or "S/FONDOS" in motivo:
                             try:
-                                # Asumimos posiciones estándar pero con manejo de error
-                                # Formato usual: Fecha | Entidad | Nro | Monto | Causal
+                                # Intento de extracción por posición (ajustar si falla)
                                 fecha = txt_cols[0]
                                 nro = txt_cols[2]
                                 monto_str = txt_cols[3]
@@ -186,8 +192,8 @@ def consultar_provincias(cuit):
     # 1. CORRIENTES (URL Directa)
     try:
         url_corrientes = f"https://www.dgrcorrientes.gob.ar/Informacionutil/gestiontransparente/consultacontribuyente/{cuit}"
-        # Usamos requests normal aquí, a veces no necesita el adaptador legacy
-        r = requests.get(url_corrientes, headers=get_headers(), verify=False, timeout=10)
+        # Usamos requests normal aquí, pero con verify=False
+        r = requests.get(url_corrientes, headers=get_headers(), verify=False, timeout=15)
         
         if r.status_code == 200:
             if "No se registran datos" in r.text or "inexistente" in r.text:
@@ -257,7 +263,7 @@ def generar_pdf_consolidado(datos):
         pdf.cell(0, 10, f"Total Deuda Sin Fondos: ${datos['total_sf']:,.2f}", 0, 1)
     else:
         pdf.set_font("Arial", "", 11)
-        pdf.cell(0, 10, "Resultado: Sin cheques rechazados por falta de fondos registrados.", 0, 1)
+        pdf.cell(0, 10, "Resultado: Sin cheques rechazados por falta de fondos.", 0, 1)
         
     pdf.ln(10)
     
@@ -304,7 +310,7 @@ def main():
                         st.session_state.step = 2
                         st.rerun()
                     else:
-                        st.error("No se pudo establecer conexión con el BCRA. Posible bloqueo de seguridad o IP.")
+                        st.error("No se pudo establecer conexión con el BCRA. Posible bloqueo de IP.")
                 else:
                     st.error("Por favor verifique el CUIT ingresado.")
 
