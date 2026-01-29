@@ -4,6 +4,10 @@ from bs4 import BeautifulSoup
 import pandas as pd
 from fpdf import FPDF
 import time
+import ssl
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
+from urllib3.poolmanager import PoolManager
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(
@@ -11,6 +15,21 @@ st.set_page_config(
     page_icon="🇦🇷",
     layout="wide"
 )
+
+# --- PARCHE SSL PARA SITIOS GUBERNAMENTALES (.GOB.AR) ---
+# Esto soluciona el error de conexión en servidores modernos (como Streamlit Cloud)
+class LegacySSLAdapter(HTTPAdapter):
+    def init_poolmanager(self, connections, maxsize, block=False):
+        ctx = create_urllib3_context()
+        ctx.load_default_certs()
+        # "Bajamos" la seguridad para aceptar cifrados viejos del gobierno
+        ctx.set_ciphers('DEFAULT@SECLEVEL=1')
+        self.poolmanager = PoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            ssl_context=ctx
+        )
 
 # --- GESTIÓN DE ESTADO (SESSION STATE) ---
 if 'step' not in st.session_state:
@@ -51,10 +70,13 @@ def extract_viewstate(html_content):
 def iniciar_sesion_bcra():
     """
     Paso 1 BCRA: Entra a la home, obtiene cookies y campos ocultos, y baja el Captcha.
+    Usa el adaptador LegacySSL para evitar errores de conexión.
     """
     session = requests.Session()
+    # APLICAMOS EL PARCHE AQUÍ:
+    session.mount('https://', LegacySSLAdapter())
+    
     session.headers.update(get_headers())
-    # Desactivamos verify=False warnings para limpiar la consola
     requests.packages.urllib3.disable_warnings() 
     
     url_form = "https://www.bcra.gob.ar/BCRAyVos/Situacion_Crediticia.asp"
@@ -62,17 +84,18 @@ def iniciar_sesion_bcra():
     
     try:
         # A. Obtener la página del formulario para sacar ViewState y Cookies
-        r_form = session.get(url_form, verify=False, timeout=10)
+        r_form = session.get(url_form, verify=False, timeout=15)
         form_data = extract_viewstate(r_form.text)
         
         # B. Obtener la imagen del Captcha (usando la misma sesión)
-        r_captcha = session.get(url_captcha, verify=False, timeout=10)
+        r_captcha = session.get(url_captcha, verify=False, timeout=15)
         
         if r_captcha.status_code == 200:
             st.session_state.bcra_session = session
             st.session_state.bcra_payload_data = form_data
             return r_captcha.content
         else:
+            st.error(f"Error descargando captcha. Status: {r_captcha.status_code}")
             return None
     except Exception as e:
         st.error(f"Error de conexión con BCRA: {str(e)}")
@@ -90,7 +113,7 @@ def procesar_bcra_resultados(cuit, captcha_text):
         'bcuil': cuit,
         'consul': captcha_text,
         'enviar': 'Consultar',
-        'B1': 'Consultar' # A veces el botón se llama B1
+        'B1': 'Consultar'
     })
     
     url_post = "https://www.bcra.gob.ar/BCRAyVos/Situacion_Crediticia.asp"
@@ -99,52 +122,41 @@ def procesar_bcra_resultados(cuit, captcha_text):
     total_deuda = 0.0
     
     try:
-        r_post = session.post(url_post, data=payload, verify=False, timeout=15)
+        r_post = session.post(url_post, data=payload, verify=False, timeout=20)
         soup = BeautifulSoup(r_post.text, 'html.parser')
         
-        # LOGICA DE PARSEO (Adaptar selectores si BCRA cambia la web)
-        # Buscamos tablas que contengan la palabra "Rechazados"
-        # Nota: Esto es genérico. En producción hay que inspeccionar la clase exacta.
+        # Lógica de búsqueda flexible en tablas
         tablas = soup.find_all('table')
         
         for tabla in tablas:
-            if "Rechazados" in str(tabla) or "Causal" in str(tabla):
+            texto_tabla = str(tabla).upper()
+            if "RECHAZADOS" in texto_tabla or "CAUSAL" in texto_tabla:
                 filas = tabla.find_all('tr')
                 for fila in filas:
                     cols = fila.find_all('td')
-                    # Validamos que sea una fila de datos (usualmente > 3 columnas)
                     if len(cols) >= 4:
                         txt_cols = [c.text.strip() for c in cols]
                         
-                        # Indices hipotéticos (Fecha, Nro, Monto, Causal)
-                        # Hay que buscar la columna que tenga el motivo
                         motivo = ""
                         monto = 0.0
-                        fecha = ""
-                        nro = ""
                         
-                        # Iteramos buscando patrones
-                        for i, txt in enumerate(txt_cols):
+                        # Buscamos el motivo en las columnas
+                        for txt in txt_cols:
                             if "FONDOS" in txt.upper():
                                 motivo = txt.upper()
-                            if "," in txt and "." in txt and any(c.isdigit() for c in txt):
-                                # Intento burdo de detectar el monto
-                                try:
-                                    clean_monto = txt.replace('.', '').replace(',', '.')
-                                    if clean_monto.replace('.','',1).isdigit():
-                                        monto = float(clean_monto)
-                                except: pass
                         
                         # Si encontramos el motivo SIN FONDOS
                         if "SIN FONDOS" in motivo or "S/FONDOS" in motivo:
-                            # Re-parseamos bien si detectamos la fila correcta
-                            # Asumimos estructura estándar: Fecha | Entidad | Nro | Monto | Causal
-                            # Esto puede requerir ajuste fino viendo el HTML real del momento
                             try:
+                                # Asumimos posiciones estándar pero con manejo de error
+                                # Formato usual: Fecha | Entidad | Nro | Monto | Causal
                                 fecha = txt_cols[0]
                                 nro = txt_cols[2]
                                 monto_str = txt_cols[3]
-                                monto = float(monto_str.replace('.', '').replace(',', '.'))
+                                
+                                # Limpieza de monto ($ 10.000,00 -> 10000.00)
+                                clean_monto = monto_str.replace('$', '').strip().replace('.', '').replace(',', '.')
+                                monto = float(clean_monto)
                                 
                                 cheques_sin_fondos.append({
                                     "Fecha": fecha,
@@ -157,14 +169,13 @@ def procesar_bcra_resultados(cuit, captcha_text):
                                 continue
 
     except Exception as e:
-        st.error(f"Error parseando BCRA: {e}")
+        st.error(f"Error procesando datos BCRA: {e}")
         
     return cheques_sin_fondos, total_deuda
 
 def consultar_provincias(cuit):
     """
-    Simulación de scrapers provinciales (Requests simples)
-    Para implementación real, hay que analizar el HTML de respuesta de cada uno.
+    Simulación de scrapers provinciales con manejo de conexión real para Corrientes.
     """
     resultados = {
         "arba": "No disponible (Requiere Token)",
@@ -175,20 +186,22 @@ def consultar_provincias(cuit):
     # 1. CORRIENTES (URL Directa)
     try:
         url_corrientes = f"https://www.dgrcorrientes.gob.ar/Informacionutil/gestiontransparente/consultacontribuyente/{cuit}"
-        r = requests.get(url_corrientes, headers=get_headers(), verify=False, timeout=5)
-        if "No se registran datos" in r.text or "inexistente" in r.text:
-            resultados['corrientes'] = "Sin antecedentes registrados en la jurisdicción"
+        # Usamos requests normal aquí, a veces no necesita el adaptador legacy
+        r = requests.get(url_corrientes, headers=get_headers(), verify=False, timeout=10)
+        
+        if r.status_code == 200:
+            if "No se registran datos" in r.text or "inexistente" in r.text:
+                resultados['corrientes'] = "Sin antecedentes registrados en la jurisdicción"
+            else:
+                resultados['corrientes'] = "Contribuyente ACTIVO (Verificar web oficial)"
         else:
-            # Aquí iría el BeautifulSoup para sacar el estado real
-            resultados['corrientes'] = "Contribuyente encontrado (Verificar web)"
+             resultados['corrientes'] = f"Error al consultar (Status {r.status_code})"
     except:
-        resultados['corrientes'] = "Error de conexión"
+        resultados['corrientes'] = "Error de conexión con DGR Corrientes"
 
     # 2. ARBA y CORDOBA (Simulados para el ejemplo)
-    # Estos sitios suelen requerir interacciones más complejas o tokens.
-    # Se dejan placeholders lógicos.
-    resultados['arba'] = "Sin deuda registrada (Simulado)"
-    resultados['cordoba'] = "Situación Fiscal: REGULAR (Simulado)"
+    resultados['arba'] = "Sin deuda registrada (Dato Simulado)"
+    resultados['cordoba'] = "Situación Fiscal: REGULAR (Dato Simulado)"
     
     return resultados
 
@@ -291,7 +304,7 @@ def main():
                         st.session_state.step = 2
                         st.rerun()
                     else:
-                        st.error("No se pudo establecer conexión con el BCRA. Intente más tarde.")
+                        st.error("No se pudo establecer conexión con el BCRA. Posible bloqueo de seguridad o IP.")
                 else:
                     st.error("Por favor verifique el CUIT ingresado.")
 
